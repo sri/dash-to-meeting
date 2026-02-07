@@ -17,7 +17,7 @@ import socket
 import subprocess
 import threading
 import time
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 import objc
@@ -95,6 +95,32 @@ def canonicalize_zoom_url(candidate: str) -> str | None:
     if not host.endswith("zoom.us"):
         return None
     return cleaned
+
+
+def to_zoom_native_url(zoom_url: str) -> str | None:
+    parsed = urlparse(zoom_url)
+    host = (parsed.hostname or "").lower()
+    if not host.endswith("zoom.us"):
+        return None
+
+    query = parse_qs(parsed.query)
+    path_parts = [part for part in parsed.path.split("/") if part]
+    meeting_id = ""
+
+    # Most common join links are /j/<meeting_id> or /w/<meeting_id>.
+    if len(path_parts) >= 2 and path_parts[0] in {"j", "w"}:
+        meeting_id = path_parts[1]
+    elif "confno" in query and query["confno"]:
+        meeting_id = query["confno"][0]
+
+    if not meeting_id:
+        return None
+
+    native_qs: dict[str, str] = {"action": "join", "confno": meeting_id}
+    if "pwd" in query and query["pwd"]:
+        native_qs["pwd"] = query["pwd"][0]
+
+    return f"zoommtg://{host}/join?{urlencode(native_qs)}"
 
 
 def extract_zoom_link(
@@ -452,7 +478,8 @@ def create_app(provider: EventProvider) -> Flask:
         if not zoom_url:
             return jsonify({"ok": False, "error": "invalid zoom url"}), 400
 
-        subprocess.run(["open", zoom_url], check=False)
+        native_zoom_url = to_zoom_native_url(zoom_url)
+        subprocess.run(["open", native_zoom_url or zoom_url], check=False)
         exit_process_after_delay()
         return jsonify({"ok": True})
 
