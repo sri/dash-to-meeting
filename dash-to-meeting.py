@@ -45,7 +45,8 @@ ZOOM_URL_RE = re.compile(
     re.IGNORECASE,
 )
 HOST = "127.0.0.1"
-DEFAULT_SOURCE = "https://calendar.google.com/calendar/ical/9ea2d2e03cd799c6e7fe2e609af19480b1f1cc6fc2535b0c4ea700852522f8f8%40group.calendar.google.com/public/basic.ics"
+DEFAULT_SOURCE_FILE_LABEL = "~/.dash-to-meeting"
+DEFAULT_SOURCE_FILE = Path("~/.dash-to-meeting").expanduser()
 
 
 @dataclass(slots=True)
@@ -164,6 +165,23 @@ def load_events(source: str):
     return ical_events(source, sort=True, fix_apple=True)
 
 
+def load_default_source() -> tuple[str | None, str | None]:
+    if not DEFAULT_SOURCE_FILE.exists():
+        return None, f"Missing source file: {DEFAULT_SOURCE_FILE}"
+
+    try:
+        content = DEFAULT_SOURCE_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"Failed reading source file {DEFAULT_SOURCE_FILE}: {exc}"
+
+    for line in content.splitlines():
+        candidate = line.strip()
+        if candidate and not candidate.startswith("#"):
+            return candidate, None
+
+    return None, f"Source file is empty: {DEFAULT_SOURCE_FILE}"
+
+
 def to_display_event(event, now: datetime, index: int) -> DisplayEvent:
     start = to_local(event.start, now)
     end_guess = start + timedelta(minutes=30)
@@ -187,10 +205,15 @@ def to_display_event(event, now: datetime, index: int) -> DisplayEvent:
 
 
 class EventProvider:
-    def __init__(self, source: str):
+    def __init__(self, source: str | None, startup_error: str | None = None):
         self.source = source
+        self.startup_error = startup_error
 
     def get_events(self) -> list[DisplayEvent]:
+        if self.startup_error:
+            raise RuntimeError(self.startup_error)
+        if not self.source:
+            raise RuntimeError("No event source configured.")
         now = datetime.now(tz=LOCAL_TZ)
         raw_events = load_events(self.source)
         return [to_display_event(event, now, i) for i, event in enumerate(raw_events)]
@@ -303,10 +326,22 @@ HTML_TEMPLATE = """<!doctype html>
       color: var(--muted);
       background: var(--card);
     }
+    .source {
+      margin: 10px 10px 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+    .source code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+    }
   </style>
 </head>
 <body>
   <div id="events"><div class="empty">Loading events…</div></div>
+  <div class="source">Reading calendar URL from: <code>{{ default_source_file }}</code></div>
   <script>
     const state = { events: [], lastError: null };
 
@@ -436,12 +471,19 @@ HTML_TEMPLATE = """<!doctype html>
     async function refreshEvents() {
       try {
         const resp = await fetch("/api/events", { cache: "no-store" });
-        if (!resp.ok) throw new Error("Could not load events.");
-        state.events = await resp.json();
+        const payload = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          const message =
+            payload && typeof payload.error === "string"
+              ? payload.error
+              : "Could not load events.";
+          throw new Error(message);
+        }
+        state.events = Array.isArray(payload) ? payload : [];
         state.lastError = null;
-      } catch {
+      } catch (error) {
         state.events = [];
-        state.lastError = "Could not load events.";
+        state.lastError = error instanceof Error ? error.message : "Could not load events.";
       }
       render();
     }
@@ -460,7 +502,10 @@ def create_app(provider: EventProvider) -> Flask:
 
     @app.get("/")
     def index():
-        return render_template_string(HTML_TEMPLATE)
+        return render_template_string(
+            HTML_TEMPLATE,
+            default_source_file=DEFAULT_SOURCE_FILE_LABEL,
+        )
 
     @app.get("/api/events")
     def api_events():
@@ -468,7 +513,7 @@ def create_app(provider: EventProvider) -> Flask:
             events = [event.as_json() for event in provider.get_events()]
             return jsonify(events)
         except Exception as exc:
-            return jsonify({"error": f"failed to load events: {exc}"}), 500
+            return jsonify({"error": str(exc) or "failed to load events"}), 500
 
     @app.post("/open")
     def open_zoom():
@@ -575,8 +620,13 @@ def show_web_widget(url: str):
     app.run()
 
 
-def main(source: str):
-    provider = EventProvider(source)
+def main(source_override: str | None):
+    source = source_override
+    startup_error = None
+    if not source:
+        source, startup_error = load_default_source()
+
+    provider = EventProvider(source, startup_error=startup_error)
     port = pick_free_port()
     app = create_app(provider)
     start_server(app, port)
@@ -591,4 +641,4 @@ def main(source: str):
 if __name__ == "__main__":
     import sys
 
-    main(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SOURCE)
+    main(sys.argv[1] if len(sys.argv) > 1 else None)
