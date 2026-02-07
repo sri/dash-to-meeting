@@ -170,7 +170,7 @@ class EventProvider:
         return [to_display_event(event, now, i) for i, event in enumerate(raw_events)]
 
 
-def exit_process_after_delay(delay_seconds: float = 0.25):
+def exit_process_after_delay(delay_seconds: float = 0.05):
     def _exit_later():
         time.sleep(delay_seconds)
         os._exit(0)
