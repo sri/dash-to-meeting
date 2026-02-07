@@ -20,25 +20,31 @@ from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyRegular,
     NSBackingStoreBuffered,
-    NSBezelStyleRounded,
-    NSButton,
     NSButtonTypeMomentaryPushIn,
+    NSButton,
+    NSColor,
+    NSFont,
+    NSLineBreakByTruncatingTail,
     NSLineBreakByWordWrapping,
+    NSScreen,
     NSScrollView,
     NSTextAlignmentLeft,
+    NSTextField,
     NSView,
     NSViewHeightSizable,
     NSViewWidthSizable,
     NSWindow,
     NSWindowStyleMaskClosable,
-    NSWindowStyleMaskResizable,
     NSWindowStyleMaskTitled,
 )
 from Foundation import NSMakeRect, NSObject
 from icalevents.icalevents import events as ical_events
 
 LOCAL_TZ = datetime.now().astimezone().tzinfo or ZoneInfo("UTC")
-ZOOM_URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+ZOOM_URL_RE = re.compile(
+    r"(https?://[^\s<>\"]+|(?:[a-z0-9.-]+\.)?zoom\.us/[^\s<>\"]+)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -71,31 +77,50 @@ def format_duration(delta: timedelta) -> str:
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
 
-    parts: list[str] = []
     if days:
-        parts.append(f"{days}d")
+        day_word = "day" if days == 1 else "days"
+        if hours:
+            hour_word = "hr" if hours == 1 else "hrs"
+            return f"{days} {day_word} {hours} {hour_word}"
+        return f"{days} {day_word}"
     if hours:
-        parts.append(f"{hours}h")
-    if minutes or not parts:
-        parts.append(f"{minutes}m")
-    return " ".join(parts[:2])
+        hour_word = "hr" if hours == 1 else "hrs"
+        if minutes:
+            min_word = "min" if minutes == 1 else "mins"
+            return f"{hours} {hour_word} {minutes} {min_word}"
+        return f"{hours} {hour_word}"
+    min_word = "min" if minutes == 1 else "mins"
+    return f"{minutes} {min_word}"
+
+def format_time(dt: datetime) -> str:
+    return dt.strftime("%I:%M%p").lstrip("0").lower()
 
 def format_relative(now: datetime, start: datetime, end: datetime) -> str:
     if start <= now <= end:
         return "current"
+    if start.date() != now.date():
+        return ""
     if now < start:
         return f"in {format_duration(start - now)}"
     return f"ended {format_duration(now - end)} ago"
 
-def format_when(start: datetime, end: datetime) -> str:
+def format_when(start: datetime, end: datetime, now: datetime) -> str:
+    if start.date() == now.date():
+        return f"{format_time(start)}-{format_time(end)}"
     if start.date() == end.date():
-        return f"{start:%a, %b %d %I:%M %p} - {end:%I:%M %p}"
-    return f"{start:%a, %b %d %I:%M %p} - {end:%a, %b %d %I:%M %p}"
+        return f"{start:%a, %b %d} {format_time(start)}-{format_time(end)}"
+    return f"{start:%a, %b %d} {format_time(start)} - {end:%a, %b %d} {format_time(end)}"
 
-def extract_zoom_link(title: str | None, description: str | None) -> str | None:
-    for text in (title or "", description or ""):
+def extract_zoom_link(
+    location: str | None,
+    title: str | None,
+    description: str | None,
+) -> str | None:
+    for text in (location or "", title or "", description or ""):
         for match in ZOOM_URL_RE.findall(text):
             candidate = match.rstrip(").,;")
+            if "://" not in candidate:
+                candidate = f"https://{candidate}"
             parsed = urlparse(candidate)
             host = (parsed.hostname or "").lower()
             if host.endswith("zoom.us"):
@@ -135,27 +160,52 @@ def to_display_event(event, now: datetime) -> DisplayEvent:
 
     title = normalize_text(event.summary, "No title")
     description = normalize_text(event.description, "(no description)")
-    zoom_link = extract_zoom_link(event.summary, event.description)
+    zoom_link = extract_zoom_link(event.location, event.summary, event.description)
 
     return DisplayEvent(
         title=title,
         description=description,
-        when_text=format_when(start, end),
+        when_text=format_when(start, end, now),
         relative_text=format_relative(now, start, end),
         zoom_link=zoom_link,
     )
 
-def event_button_text(event: DisplayEvent) -> str:
-    description = event.description
-    if len(description) > 200:
-        description = f"{description[:197]}..."
-    link_line = event.zoom_link or "No Zoom link found"
-    return (
-        f"{event.title}\n"
-        f"{event.when_text} ({event.relative_text})\n"
-        f"{description}\n"
-        f"{link_line}"
+def make_label(
+    text: str,
+    frame,
+    *,
+    font_size: float,
+    bold: bool = False,
+    color=None,
+    wraps: bool = False,
+    selectable: bool = False,
+):
+    label = NSTextField.alloc().initWithFrame_(frame)
+    label.setStringValue_(text)
+    label.setEditable_(False)
+    label.setSelectable_(selectable)
+    label.setBezeled_(False)
+    label.setBordered_(False)
+    label.setDrawsBackground_(False)
+    label.setAlignment_(NSTextAlignmentLeft)
+    label.setFont_(
+        NSFont.boldSystemFontOfSize_(font_size)
+        if bold
+        else NSFont.systemFontOfSize_(font_size)
     )
+    if color is not None:
+        label.setTextColor_(color)
+    if wraps:
+        label.cell().setWraps_(True)
+        label.setLineBreakMode_(NSLineBreakByWordWrapping)
+    else:
+        label.setLineBreakMode_(NSLineBreakByTruncatingTail)
+    return label
+
+def event_meta_line(event: DisplayEvent) -> str:
+    if event.relative_text:
+        return f"{event.when_text} ({event.relative_text})"
+    return event.when_text
 
 class EventWindowController(NSObject):
     def initWithEvents_(self, events):
@@ -184,11 +234,17 @@ def show_events(events: list[DisplayEvent]):
     app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
     controller = EventWindowController.alloc().initWithEvents_(events)
 
+    screen = NSScreen.mainScreen()
+    visible = screen.visibleFrame() if screen is not None else NSMakeRect(0.0, 0.0, 1440.0, 900.0)
+    window_width = 255.0
+    window_height = max(720.0, visible.size.height - 36.0)
+    window_x = visible.origin.x + visible.size.width - window_width - 12.0
+    window_y = visible.origin.y + 18.0
+
     window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-        NSMakeRect(150.0, 150.0, 920.0, 660.0),
+        NSMakeRect(window_x, window_y, window_width, window_height),
         NSWindowStyleMaskTitled
-        | NSWindowStyleMaskClosable
-        | NSWindowStyleMaskResizable,
+        | NSWindowStyleMaskClosable,
         NSBackingStoreBuffered,
         False,
     )
@@ -197,35 +253,102 @@ def show_events(events: list[DisplayEvent]):
     window.setDelegate_(controller)
 
     content = window.contentView()
+    content.setWantsLayer_(True)
+    content.layer().setBackgroundColor_(
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.08, 0.09, 0.11, 1.0).CGColor()
+    )
+
     scroll = NSScrollView.alloc().initWithFrame_(content.bounds())
     scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
     scroll.setHasVerticalScroller_(True)
+    scroll.setDrawsBackground_(False)
 
-    row_height = 120.0
+    row_height = 240.0
     gap = 10.0
-    padding = 12.0
-    doc_width = 900.0
-    doc_height = max(640.0, (row_height + gap) * len(events) + padding * 2)
+    padding = 10.0
+    doc_width = 239.0
+    doc_height = max(window_height - 30.0, (row_height + gap) * len(events) + padding * 2)
     document = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, doc_width, doc_height))
+    document.setAutoresizingMask_(NSViewWidthSizable)
+    document.setWantsLayer_(True)
+    document.layer().setBackgroundColor_(
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.08, 0.09, 0.11, 1.0).CGColor()
+    )
+    row_width = doc_width - (padding * 2)
 
     for idx, event in enumerate(events):
         y = doc_height - padding - row_height - idx * (row_height + gap)
-        button = NSButton.alloc().initWithFrame_(
-            NSMakeRect(padding, y, doc_width - (padding * 2), row_height)
+
+        card = NSView.alloc().initWithFrame_(NSMakeRect(padding, y, row_width, row_height))
+        card.setWantsLayer_(True)
+        layer = card.layer()
+        layer.setCornerRadius_(14.0)
+        layer.setBorderWidth_(1.0)
+        layer.setBorderColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.28, 0.33, 0.40, 1.0).CGColor()
         )
-        button.setButtonType_(NSButtonTypeMomentaryPushIn)
-        button.setBezelStyle_(NSBezelStyleRounded)
-        button.setAlignment_(NSTextAlignmentLeft)
-        button.setTitle_(event_button_text(event))
-        button.setTag_(idx)
-        button.setTarget_(controller)
-        button.setAction_("openEvent:")
+        layer.setBackgroundColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.13, 0.15, 0.18, 1.0).CGColor()
+        )
+        layer.setShadowColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.60).CGColor()
+        )
+        layer.setShadowOpacity_(0.45)
+        layer.setShadowRadius_(5.0)
+        layer.setShadowOffset_((0.0, -1.0))
 
-        cell = button.cell()
-        cell.setWraps_(True)
-        cell.setLineBreakMode_(NSLineBreakByWordWrapping)
+        inner = 11.0
+        content_width = row_width - (inner * 2)
 
-        document.addSubview_(button)
+        title = make_label(
+            event.title,
+            NSMakeRect(inner, row_height - 35.0, content_width, 22.0),
+            font_size=14.0,
+            bold=True,
+            color=NSColor.colorWithCalibratedRed_green_blue_alpha_(0.93, 0.95, 0.98, 1.0),
+        )
+        card.addSubview_(title)
+
+        meta = make_label(
+            event_meta_line(event),
+            NSMakeRect(inner, row_height - 58.0, content_width, 20.0),
+            font_size=11.5,
+            color=NSColor.colorWithCalibratedRed_green_blue_alpha_(0.62, 0.78, 0.97, 1.0),
+        )
+        card.addSubview_(meta)
+
+        description_text = event.description
+        if len(description_text) > 330:
+            description_text = f"{description_text[:327]}..."
+        description = make_label(
+            description_text,
+            NSMakeRect(inner, 58.0, content_width, 92.0),
+            font_size=12.0,
+            color=NSColor.colorWithCalibratedRed_green_blue_alpha_(0.78, 0.82, 0.88, 1.0),
+            wraps=True,
+        )
+        card.addSubview_(description)
+
+        zoom_line = f"Zoom: {event.zoom_link}" if event.zoom_link else "Zoom: (none found)"
+        zoom = make_label(
+            zoom_line,
+            NSMakeRect(inner, 20.0, content_width, 30.0),
+            font_size=11.5,
+            color=NSColor.colorWithCalibratedRed_green_blue_alpha_(0.52, 0.85, 0.68, 1.0),
+            wraps=True,
+        )
+        card.addSubview_(zoom)
+
+        click_overlay = NSButton.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, row_width, row_height))
+        click_overlay.setButtonType_(NSButtonTypeMomentaryPushIn)
+        click_overlay.setBordered_(False)
+        click_overlay.setTitle_("")
+        click_overlay.setTag_(idx)
+        click_overlay.setTarget_(controller)
+        click_overlay.setAction_("openEvent:")
+        card.addSubview_(click_overlay)
+
+        document.addSubview_(card)
 
     scroll.setDocumentView_(document)
     content.addSubview_(scroll)
